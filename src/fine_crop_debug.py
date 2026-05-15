@@ -26,6 +26,8 @@ def detect_red_roi(
     h_span: int = 12,
     s_min: int = 50,
     v_min: int = 50,
+    close_iter: int = 1,
+    open_iter: int = 1,
 ) -> dict | None:
     """Find the largest red-ish rectangular region. Returns {x,y,w,h,area} or None."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -40,8 +42,10 @@ def detect_red_roi(
     mask = cv2.bitwise_or(mask1, mask2)
 
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    if close_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+    if open_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iter)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -61,6 +65,8 @@ def make_morph_mask(
     h_span: int = 12,
     s_min: int = 50,
     v_min: int = 50,
+    close_iter: int = 1,
+    open_iter: int = 1,
 ) -> np.ndarray:
     """Return the binary mask AFTER morphology (close+open), before contour extraction."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -75,8 +81,10 @@ def make_morph_mask(
     mask = cv2.bitwise_or(mask1, mask2)
 
     kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    if close_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+    if open_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iter)
     return mask
 
 
@@ -151,6 +159,8 @@ def api_detect_red():
     h_span = int(data.get("h_span", 12))
     s_min = int(data.get("s_min", 50))
     v_min = int(data.get("v_min", 50))
+    close_iter = int(data.get("close_iter", 1))
+    open_iter = int(data.get("open_iter", 1))
 
     path = WORK_ROOT / cat / inst / name
     if not path.exists():
@@ -160,7 +170,7 @@ def api_detect_red():
     if image is None:
         return jsonify({"error": "failed to read image"}), 500
 
-    result = detect_red_roi(image, h_span=h_span, s_min=s_min, v_min=v_min)
+    result = detect_red_roi(image, h_span=h_span, s_min=s_min, v_min=v_min, close_iter=close_iter, open_iter=open_iter)
     h, w = image.shape[:2]
     return jsonify({"roi": result, "image_width": w, "image_height": h})
 
@@ -174,6 +184,8 @@ def api_morph_mask():
     h_span = int(data.get("h_span", 12))
     s_min = int(data.get("s_min", 50))
     v_min = int(data.get("v_min", 50))
+    close_iter = int(data.get("close_iter", 1))
+    open_iter = int(data.get("open_iter", 1))
 
     path = WORK_ROOT / cat / inst / name
     if not path.exists():
@@ -183,7 +195,7 @@ def api_morph_mask():
     if image is None:
         return jsonify({"error": "failed to read image"}), 500
 
-    morph = make_morph_mask(image, h_span=h_span, s_min=s_min, v_min=v_min)
+    morph = make_morph_mask(image, h_span=h_span, s_min=s_min, v_min=v_min, close_iter=close_iter, open_iter=open_iter)
     ok, buf = cv2.imencode(".png", morph)
     if not ok:
         return jsonify({"error": "encode failed"}), 500
@@ -256,6 +268,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <label>H_span <input type="range" id="sl-hspan" min="2" max="40" value="12" step="1"><span class="val" id="val-hspan">12</span></label>
   <label>S_min <input type="range" id="sl-smin" min="0" max="255" value="50" step="1"><span class="val" id="val-smin">50</span></label>
   <label>V_min <input type="range" id="sl-vmin" min="0" max="255" value="50" step="1"><span class="val" id="val-vmin">50</span></label>
+  <label>Close <input type="range" id="sl-close" min="0" max="4" value="1" step="1"><span class="val" id="val-close">1</span></label>
+  <label>Open <input type="range" id="sl-open" min="0" max="4" value="1" step="1"><span class="val" id="val-open">1</span></label>
   <button id="btn-reset-hsv">Reset HSV</button>
   <span style="font-size:10px;color:#666;">| red ranges: [0,&thinsp;<span id="lbl-lo">12</span>] &amp; [<span id="lbl-hi">168</span>,&thinsp;180]</span>
 </div>
@@ -294,7 +308,7 @@ let roi = null;
 let drawing = false, drawStart = {x:0, y:0};
 
 // HSV params (synced to sliders)
-let hsv = { h_span: 12, s_min: 50, v_min: 50 };
+let hsv = { h_span: 12, s_min: 50, v_min: 50, close_iter: 1, open_iter: 1 };
 
 // ═══════════════════════════════════════════════════════════════════════
 //  DOM refs
@@ -304,8 +318,8 @@ const catSel = $('cat-select'), instSel = $('inst-select'), imgSel = $('img-sele
 const btnPrev = $('btn-prev'), btnNext = $('btn-next'), imgCounter = $('img-counter');
 const btnDetect = $('btn-detect'), btnClear = $('btn-clear-roi'), btnSave = $('btn-save-roi');
 const chkAuto = $('chk-auto');
-const slHspan = $('sl-hspan'), slSmin = $('sl-smin'), slVmin = $('sl-vmin');
-const valHspan = $('val-hspan'), valSmin = $('val-smin'), valVmin = $('val-vmin');
+const slHspan = $('sl-hspan'), slSmin = $('sl-smin'), slVmin = $('sl-vmin'), slClose = $('sl-close'), slOpen = $('sl-open');
+const valHspan = $('val-hspan'), valSmin = $('val-smin'), valVmin = $('val-vmin'), valClose = $('val-close'), valOpen = $('val-open');
 const lblLo = $('lbl-lo'), lblHi = $('lbl-hi');
 const origCanvas = $('orig-canvas'), roiCanvas = $('roi-canvas'), maskCanvas = $('mask-canvas'), morphCanvas = $('morph-canvas');
 const origCtx = origCanvas.getContext('2d'), roiCtx = roiCanvas.getContext('2d'), maskCtx = maskCanvas.getContext('2d'), morphCtx = morphCanvas.getContext('2d');
@@ -385,6 +399,8 @@ function renderMask() {
   valHspan.textContent = hsv.h_span;
   valSmin.textContent = hsv.s_min;
   valVmin.textContent = hsv.v_min;
+  valClose.textContent = hsv.close_iter;
+  valOpen.textContent = hsv.open_iter;
   lblLo.textContent = hsv.h_span;
   lblHi.textContent = 180 - hsv.h_span;
 }
@@ -398,7 +414,7 @@ function renderMorphMask() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       category: curCat, instance: curInst, name: curImg,
-      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter,
     }),
   }).then(r => r.blob()).then(blob => {
     const img = new Image();
@@ -475,12 +491,12 @@ btnDetect.addEventListener('click', runDetect);
 btnClear.addEventListener('click', () => { roi = null; renderAll(); });
 btnSave.addEventListener('click', saveRoiCrop);
 $('btn-reset-hsv').addEventListener('click', () => {
-  slHspan.value = 12; slSmin.value = 50; slVmin.value = 50;
+  slHspan.value = 12; slSmin.value = 50; slVmin.value = 50; slClose.value = 1; slOpen.value = 1;
   readSliders();
 });
 
 // HSV sliders → re-render mask + optionally re-detect
-[slHspan, slSmin, slVmin].forEach(sl => {
+[slHspan, slSmin, slVmin, slClose, slOpen].forEach(sl => {
   sl.addEventListener('input', () => {
     readSliders();
     renderMask();
@@ -488,6 +504,7 @@ $('btn-reset-hsv').addEventListener('click', () => {
   sl.addEventListener('change', () => {
     readSliders();
     renderMask();
+    renderMorphMask();
     if (chkAuto.checked && origImg) runDetect();
   });
 });
@@ -496,6 +513,8 @@ function readSliders() {
   hsv.h_span = parseInt(slHspan.value);
   hsv.s_min = parseInt(slSmin.value);
   hsv.v_min = parseInt(slVmin.value);
+  hsv.close_iter = parseInt(slClose.value);
+  hsv.open_iter = parseInt(slOpen.value);
 }
 
 function selectImage() {
@@ -635,7 +654,7 @@ async function runDetect() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       category: curCat, instance: curInst, name: curImg,
-      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter,
     }),
   });
   const data = await resp.json();
