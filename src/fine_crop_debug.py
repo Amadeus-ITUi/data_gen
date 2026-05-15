@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import sys
+import threading
 from pathlib import Path
 
 import cv2
@@ -297,6 +298,131 @@ def api_morph_mask():
 
 
 # ---------------------------------------------------------------------------
+#  Batch export
+# ---------------------------------------------------------------------------
+
+_batch_state: dict = {"running": False, "total": 0, "done": 0, "failed": 0, "status": "idle"}
+
+
+def _process_image(img_path: Path, out_dir: Path, params: dict) -> bool:
+    """Process one image: detect ROI, crop, save. Returns True on success."""
+    image = cv2.imread(str(img_path))
+    if image is None:
+        return False
+
+    mode = params.get("mode", "contour")
+    if mode == "bottom":
+        result = detect_red_roi_v2(
+            image,
+            h_span=params.get("h_span", 12),
+            s_min=params.get("s_min", 50),
+            v_min=params.get("v_min", 50),
+            close_iter=params.get("close_iter", 1),
+            open_iter=params.get("open_iter", 1),
+            ratio_w=params.get("ratio_w", 1.0),
+            ratio_h=params.get("ratio_h", 0.42),
+            offset_ratio=params.get("offset_ratio", 0.417),
+        )
+    else:
+        result = detect_red_roi(
+            image,
+            h_span=params.get("h_span", 12),
+            s_min=params.get("s_min", 50),
+            v_min=params.get("v_min", 50),
+            close_iter=params.get("close_iter", 1),
+            open_iter=params.get("open_iter", 1),
+        )
+
+    if result is None:
+        return False
+
+    x, y, w, h = result["x"], result["y"], result["w"], result["h"]
+    if x < 0 or y < 0 or w <= 0 or h <= 0:
+        return False
+
+    x = max(0, x)
+    y = max(0, y)
+    w = min(w, image.shape[1] - x)
+    h = min(h, image.shape[0] - y)
+    if w <= 0 or h <= 0:
+        return False
+
+    crop = image[y:y + h, x:x + w]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = img_path.stem
+    out_path = out_dir / f"{stem}__fine.png"
+    cv2.imwrite(str(out_path), crop)
+    return True
+
+
+def _batch_worker(params: dict) -> None:
+    global _batch_state, WORK_ROOT
+    _batch_state["running"] = True
+    _batch_state["done"] = 0
+    _batch_state["failed"] = 0
+    _batch_state["total"] = 0
+
+    output_root = WORK_ROOT.parent / "roi_crop"
+
+    try:
+        # Count total
+        for cat in CATEGORIES:
+            for inst in INSTANCES.get(cat, []):
+                _batch_state["total"] += len(IMAGES.get(cat, {}).get(inst, []))
+
+        _batch_state["status"] = "processing"
+
+        for cat in CATEGORIES:
+            for inst in INSTANCES.get(cat, []):
+                img_files = IMAGES.get(cat, {}).get(inst, [])
+                out_dir = output_root / cat / inst
+                for fname in img_files:
+                    img_path = WORK_ROOT / cat / inst / fname
+                    try:
+                        ok = _process_image(img_path, out_dir, params)
+                        if ok:
+                            _batch_state["done"] += 1
+                        else:
+                            _batch_state["failed"] += 1
+                    except Exception:
+                        _batch_state["failed"] += 1
+        _batch_state["status"] = "done"
+    except Exception as e:
+        _batch_state["status"] = f"error: {e}"
+    finally:
+        _batch_state["running"] = False
+
+
+@app.route("/api/batch-export", methods=["POST"])
+def api_batch_export():
+    global _batch_state
+    if _batch_state["running"]:
+        return jsonify({"error": "batch already running"}), 409
+
+    data = request.get_json(silent=True) or {}
+    params = {
+        "mode": data.get("mode", "contour"),
+        "h_span": int(data.get("h_span", 12)),
+        "s_min": int(data.get("s_min", 50)),
+        "v_min": int(data.get("v_min", 50)),
+        "close_iter": int(data.get("close_iter", 1)),
+        "open_iter": int(data.get("open_iter", 1)),
+        "ratio_w": float(data.get("ratio_w", 1.0)),
+        "ratio_h": float(data.get("ratio_h", 0.42)),
+        "offset_ratio": float(data.get("offset_ratio", 0.417)),
+    }
+
+    thread = threading.Thread(target=_batch_worker, args=(params,), daemon=True)
+    thread.start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/batch-progress")
+def api_batch_progress():
+    return jsonify(_batch_state)
+
+
+# ---------------------------------------------------------------------------
 #  Frontend (embedded HTML)
 # ---------------------------------------------------------------------------
 
@@ -355,6 +481,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <button id="btn-detect">Detect</button>
   <button id="btn-clear-roi">Clear ROI</button>
   <button id="btn-save-roi">Save Crop</button>
+  <button id="btn-batch" style="background:#c0392b;">Batch Export</button>
 </div>
 
 <!-- ── HSV sliders ── -->
@@ -393,6 +520,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </main>
 
 <div class="status-bar" id="status">Loading...</div>
+<div id="batch-progress" style="display:none; background:#c0392b; padding:4px 12px; font-size:11px; color:#fff; flex-shrink:0;"><span id="batch-msg"></span> <span id="batch-pct"></span></div>
 
 <script>
 // ═══════════════════════════════════════════════════════════════════════
@@ -424,6 +552,7 @@ const origCanvas = $('orig-canvas'), roiCanvas = $('roi-canvas'), maskCanvas = $
 const origCtx = origCanvas.getContext('2d'), roiCtx = roiCanvas.getContext('2d'), maskCtx = maskCanvas.getContext('2d'), morphCtx = morphCanvas.getContext('2d');
 const infoOrig = $('info-orig'), infoRoi = $('info-roi'), infoMask = $('info-mask'), infoMorph = $('info-morph');
 const statusBar = $('status');
+const btnBatch = $('btn-batch'), batchProg = $('batch-progress'), batchMsg = $('batch-msg'), batchPct = $('batch-pct');
 
 // ═══════════════════════════════════════════════════════════════════════
 //  RGB → HSV (client-side, for real-time mask)
@@ -818,6 +947,48 @@ function status(msg) { statusBar.textContent = msg; }
 // ═══════════════════════════════════════════════════════════════════════
 //  Start
 // ═══════════════════════════════════════════════════════════════════════
+// batch export
+function startBatch() {
+  if (!confirm('Export ROI crops for ALL ' + categories.length + ' categories, all instances? This may take a while.')) return;
+  batchProg.style.display = 'block';
+  batchMsg.textContent = 'Starting batch export...';
+  batchPct.textContent = '';
+  btnBatch.disabled = true;
+  fetch('/api/batch-export', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      mode: hsv.mode, h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min,
+      close_iter: hsv.close_iter, open_iter: hsv.open_iter,
+      ratio_w: hsv.ratio_w, ratio_h: hsv.ratio_h, offset_ratio: hsv.offset_ratio,
+    }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { batchMsg.textContent = data.error; btnBatch.disabled = false; return; }
+    pollProgress();
+  });
+}
+function pollProgress() {
+  fetch('/api/batch-progress').then(r => r.json()).then(data => {
+    if (!data.running && data.status === 'done') {
+      batchMsg.textContent = 'Done: ' + data.done + ' OK, ' + data.failed + ' failed, ' + data.total + ' total.';
+      batchPct.textContent = '';
+      btnBatch.disabled = false;
+      batchProg.style.background = '#27ae60';
+      return;
+    }
+    if (!data.running && data.status !== 'processing') {
+      batchMsg.textContent = data.status;
+      btnBatch.disabled = false;
+      return;
+    }
+    const pct = data.total > 0 ? (100 * (data.done + data.failed) / data.total).toFixed(1) : 0;
+    batchMsg.textContent = data.done + ' OK / ' + data.failed + ' failed / ' + data.total + ' total';
+    batchPct.textContent = pct + '%';
+    setTimeout(pollProgress, 1000);
+  }).catch(() => { setTimeout(pollProgress, 2000); });
+}
+btnBatch.addEventListener('click', startBatch);
+
 init();
 </script>
 </body>
