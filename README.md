@@ -64,7 +64,72 @@ py -3.13 -m src.dataset_builder detect --config config/dataset_build.yaml
 ## 说明
 
 - 当前 `detect` 阶段依赖已经训练好的 YOLO 权重。
-- 每帧默认只保留置信度最高的一个目标框，适合“一段视频只拍一个实例”的采集方式。
+- 每帧默认只保留置信度最高的一个目标框，适合”一段视频只拍一个实例”的采集方式。
 - `rough_crop` 直接用 YOLO 提供 ROI，不做类别区分，类别以视频文件夹名为准。
 - 如果某类人工复核后不足 500 张，`finalize` 会保留全部并在 `summary.csv` 里报告缺口。
 - 当 `output.review_enabled: false` 时，`select` 不再复制到 `work/review/`，而是直接把候选图写入 manifest，供 `finalize` 直接使用。
+
+---
+
+## 后处理工具
+
+### 1. 打平实例文件夹 (`flatten_instances`)
+
+把大类下的实例子文件夹合并，所有图片直接放在大类文件夹内。
+
+```powershell
+# 打平 roi_crop，输出到 work/roi_crop_flatten/
+python -m src.flatten_instances --source work/roi_crop_sampled_0515_30006_size_0515_64
+
+# 指定输出目录
+python -m src.flatten_instances --source work/roi_crop --output work/my_flat
+
+# 只统计不复制
+python -m src.flatten_instances --source work/roi_crop --dry-run
+
+# 用符号链接代替复制（省空间）
+python -m src.flatten_instances --source work/roi_crop --symlink
+```
+
+### 2. 调试平台网页 (5000) — Fine Crop Debug
+
+HSV 调参 + 红矩形检测 + 交互式 ROI 绘制 + 批量导出。
+
+```powershell
+python -m src.fine_crop_debug --port 5000
+# 浏览器访问 http://127.0.0.1:5000
+```
+
+- 三个导航层级（大类 / 实例 / 图片），支持键盘 `←` `→` 切换
+- 四个面板：原图 + ROI 裁剪 + Raw HSV Mask + Morph Mask
+- 可调滑块：H_span、S_min、V_min、Close、Open、Mode、R_W、R_H、Lift
+- 支持手动拖拽绘制 ROI，或自动检测红色方块
+- **Batch Export** 按钮：用当前参数批量导出全部图片的 ROI 裁剪结果到 `work/roi_crop/`
+
+### 3. 数据集采样网页 (5001) — Dataset Sampler
+
+从 work 下的数据集中按时间间隔均匀采样，控制每类总量。
+
+```powershell
+python -m src.dataset_sampler --port 5001
+# 浏览器访问 http://127.0.0.1:5001
+```
+
+- 自动扫描 `work/` 下含 6 大类子文件夹的数据源
+- 设置每类抽取数量（默认 5000），额度按实例均分
+- 按文件名排序后间隔选取，保证时间维度均匀覆盖
+- 输出到 `work/<source>_sampled_<MMDD>_<N>/`
+
+### 4. 缩放填白网页 (5002) — Image Resizer
+
+等比缩放到 n×n 并灰色填充，保持原图不变形。
+
+```powershell
+python -m src.image_resizer --port 5002
+# 浏览器访问 http://127.0.0.1:5002
+```
+
+- 自动扫描 `work/` 下的数据源
+- 设置目标尺寸（默认 64×64）
+- 长边等比缩放，短边居中，空白处填充灰色 (128, 128, 128)
+- 输出到 `work/<source>_size_<MMDD>_<N>/`
