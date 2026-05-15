@@ -1,0 +1,723 @@
+from __future__ import annotations
+
+import argparse
+import io
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+from flask import Flask, jsonify, request, send_file
+
+app = Flask(__name__)
+
+WORK_ROOT: Path | None = None
+CATEGORIES: list[str] = []
+INSTANCES: dict[str, list[str]] = {}
+IMAGES: dict[str, dict[str, list[str]]] = {}
+
+
+# ---------------------------------------------------------------------------
+#  CV: find the largest red region in an image
+# ---------------------------------------------------------------------------
+
+def detect_red_roi(
+    image: np.ndarray,
+    h_span: int = 12,
+    s_min: int = 50,
+    v_min: int = 50,
+) -> dict | None:
+    """Find the largest red-ish rectangular region. Returns {x,y,w,h,area} or None."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    lower_red1 = np.array([0, s_min, v_min], dtype=np.uint8)
+    upper_red1 = np.array([h_span, 255, 255], dtype=np.uint8)
+    lower_red2 = np.array([180 - h_span, s_min, v_min], dtype=np.uint8)
+    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    if area <= 50:
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest)
+    return {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": float(area)}
+
+
+def make_morph_mask(
+    image: np.ndarray,
+    h_span: int = 12,
+    s_min: int = 50,
+    v_min: int = 50,
+) -> np.ndarray:
+    """Return the binary mask AFTER morphology (close+open), before contour extraction."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    lower_red1 = np.array([0, s_min, v_min], dtype=np.uint8)
+    upper_red1 = np.array([h_span, 255, 255], dtype=np.uint8)
+    lower_red2 = np.array([180 - h_span, s_min, v_min], dtype=np.uint8)
+    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    return mask
+
+
+# ---------------------------------------------------------------------------
+#  Data discovery
+# ---------------------------------------------------------------------------
+
+def discover_structure(work_root: Path) -> tuple[list[str], dict[str, list[str]], dict[str, dict[str, list[str]]]]:
+    categories: list[str] = []
+    instances: dict[str, list[str]] = {}
+    images: dict[str, dict[str, list[str]]] = {}
+
+    if not work_root.exists():
+        return categories, instances, images
+
+    for cat_dir in sorted(p for p in work_root.iterdir() if p.is_dir()):
+        cat = cat_dir.name
+        categories.append(cat)
+        instances[cat] = []
+        images[cat] = {}
+
+        for inst_dir in sorted(p for p in cat_dir.iterdir() if p.is_dir()):
+            inst = inst_dir.name
+            instances[cat].append(inst)
+
+            pngs = sorted(p.name for p in inst_dir.glob("*.png") if p.is_file())
+            jpgs = sorted(p.name for p in inst_dir.glob("*.jpg") if p.is_file())
+            images[cat][inst] = pngs + jpgs
+
+    return categories, instances, images
+
+
+# ---------------------------------------------------------------------------
+#  API routes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/structure")
+def api_structure():
+    return jsonify({
+        "categories": CATEGORIES,
+        "instances": INSTANCES,
+        "image_count": {
+            cat: {inst: len(files) for inst, files in inst_map.items()}
+            for cat, inst_map in IMAGES.items()
+        },
+    })
+
+
+@app.route("/api/images/<category>/<instance>")
+def api_instance_images(category: str, instance: str):
+    files = IMAGES.get(category, {}).get(instance, [])
+    return jsonify({"category": category, "instance": instance, "images": files})
+
+
+@app.route("/api/image-file")
+def api_image_file():
+    cat = request.args.get("category", "")
+    inst = request.args.get("instance", "")
+    name = request.args.get("name", "")
+    path = WORK_ROOT / cat / inst / name
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+    return send_file(str(path), mimetype="image/png")
+
+
+@app.route("/api/detect-red", methods=["POST"])
+def api_detect_red():
+    data = request.get_json(silent=True) or {}
+    cat = data.get("category", "")
+    inst = data.get("instance", "")
+    name = data.get("name", "")
+    h_span = int(data.get("h_span", 12))
+    s_min = int(data.get("s_min", 50))
+    v_min = int(data.get("v_min", 50))
+
+    path = WORK_ROOT / cat / inst / name
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+
+    image = cv2.imread(str(path))
+    if image is None:
+        return jsonify({"error": "failed to read image"}), 500
+
+    result = detect_red_roi(image, h_span=h_span, s_min=s_min, v_min=v_min)
+    h, w = image.shape[:2]
+    return jsonify({"roi": result, "image_width": w, "image_height": h})
+
+
+@app.route("/api/morph-mask", methods=["POST"])
+def api_morph_mask():
+    data = request.get_json(silent=True) or {}
+    cat = data.get("category", "")
+    inst = data.get("instance", "")
+    name = data.get("name", "")
+    h_span = int(data.get("h_span", 12))
+    s_min = int(data.get("s_min", 50))
+    v_min = int(data.get("v_min", 50))
+
+    path = WORK_ROOT / cat / inst / name
+    if not path.exists():
+        return jsonify({"error": "file not found"}), 404
+
+    image = cv2.imread(str(path))
+    if image is None:
+        return jsonify({"error": "failed to read image"}), 500
+
+    morph = make_morph_mask(image, h_span=h_span, s_min=s_min, v_min=v_min)
+    ok, buf = cv2.imencode(".png", morph)
+    if not ok:
+        return jsonify({"error": "encode failed"}), 500
+    return send_file(io.BytesIO(buf.tobytes()), mimetype="image/png")
+
+
+# ---------------------------------------------------------------------------
+#  Frontend (embedded HTML)
+# ---------------------------------------------------------------------------
+
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fine Crop Debug</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
+
+  /* ── header bar ── */
+  #topbar { background: #16213e; padding: 6px 12px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; flex-wrap: wrap; }
+  #topbar h1 { font-size: 15px; color: #e94560; white-space: nowrap; }
+  #topbar label { font-size: 11px; color: #999; }
+  #topbar select, #topbar button { padding: 3px 7px; border-radius: 3px; border: 1px solid #444; background: #0f3460; color: #eee; font-size: 12px; cursor: pointer; }
+  #topbar button:hover { background: #e94560; }
+  .nav-group { display: flex; gap: 4px; align-items: center; }
+  .nav-group button { min-width: 28px; }
+
+  /* ── hsv sliders row ── */
+  #slider-bar { background: #1a2744; padding: 4px 12px; display: flex; align-items: center; gap: 14px; flex-shrink: 0; flex-wrap: wrap; border-bottom: 1px solid #2a3a5c; }
+  #slider-bar label { font-size: 11px; color: #ccc; white-space: nowrap; }
+  #slider-bar input[type=range] { width: 100px; accent-color: #e94560; }
+  #slider-bar .val { display: inline-block; width: 32px; text-align: right; font-size: 11px; color: #e94560; }
+  #slider-bar button { padding: 3px 10px; border-radius: 3px; border: 1px solid #444; background: #0f3460; color: #eee; font-size: 12px; cursor: pointer; }
+  #slider-bar button:hover { background: #e94560; }
+
+  /* ── 2x2 panel grid ── */
+  main { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; flex: 1; gap: 3px; padding: 3px; overflow: hidden; min-height: 0; }
+  .panel { display: flex; flex-direction: column; background: #16213e; border-radius: 5px; overflow: hidden; min-width: 0; }
+  .panel-header { padding: 4px 10px; font-size: 12px; font-weight: 600; background: #0f3460; flex-shrink: 0; display: flex; justify-content: space-between; align-items: center; }
+  .panel-header .info { font-size: 10px; color: #888; font-weight: 400; }
+  .canvas-wrap { flex: 1; position: relative; overflow: auto; display: flex; justify-content: center; align-items: center; padding: 6px; }
+  canvas { border: 1px solid #333; max-width: 100%; max-height: 100%; }
+  #orig-canvas { cursor: crosshair; }
+  .status-bar { background: #0f3460; padding: 3px 10px; font-size: 11px; color: #999; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<!-- ── top bar: navigation ── -->
+<div id="topbar">
+  <h1>Fine Crop Debug</h1>
+  <label>Category</label><select id="cat-select"></select>
+  <label>Instance</label><select id="inst-select"></select>
+  <label>Image</label><select id="img-select" style="min-width:180px;"></select>
+  <div class="nav-group">
+    <button id="btn-prev" title="prev">&lt;</button>
+    <button id="btn-next" title="next">&gt;</button>
+    <span id="img-counter" style="font-size:11px;color:#888;">0/0</span>
+  </div>
+  <label style="margin-left:6px;"><input type="checkbox" id="chk-auto" checked> Auto</label>
+  <button id="btn-detect">Detect</button>
+  <button id="btn-clear-roi">Clear ROI</button>
+  <button id="btn-save-roi">Save Crop</button>
+</div>
+
+<!-- ── HSV sliders ── -->
+<div id="slider-bar">
+  <label>H_span <input type="range" id="sl-hspan" min="2" max="40" value="12" step="1"><span class="val" id="val-hspan">12</span></label>
+  <label>S_min <input type="range" id="sl-smin" min="0" max="255" value="50" step="1"><span class="val" id="val-smin">50</span></label>
+  <label>V_min <input type="range" id="sl-vmin" min="0" max="255" value="50" step="1"><span class="val" id="val-vmin">50</span></label>
+  <button id="btn-reset-hsv">Reset HSV</button>
+  <span style="font-size:10px;color:#666;">| red ranges: [0,&thinsp;<span id="lbl-lo">12</span>] &amp; [<span id="lbl-hi">168</span>,&thinsp;180]</span>
+</div>
+
+<!-- ── 2x2 panels ── -->
+<main>
+  <div class="panel">
+    <div class="panel-header">Original <span class="info" id="info-orig"></span></div>
+    <div class="canvas-wrap"><canvas id="orig-canvas"></canvas></div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">ROI Crop <span class="info" id="info-roi"></span></div>
+    <div class="canvas-wrap"><canvas id="roi-canvas"></canvas></div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">Raw HSV Mask <span class="info" id="info-mask"></span></div>
+    <div class="canvas-wrap"><canvas id="mask-canvas"></canvas></div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">Morph Mask (after close+open) <span class="info" id="info-morph"></span></div>
+    <div class="canvas-wrap"><canvas id="morph-canvas"></canvas></div>
+  </div>
+</main>
+
+<div class="status-bar" id="status">Loading...</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════
+//  State
+// ═══════════════════════════════════════════════════════════════════════
+let categories = [], instances = {}, imageMap = {};
+let curCat = '', curInst = '', curImg = '';
+let curImgIdx = 0, curImgList = [];
+let origImg = null;
+let roi = null;
+let drawing = false, drawStart = {x:0, y:0};
+
+// HSV params (synced to sliders)
+let hsv = { h_span: 12, s_min: 50, v_min: 50 };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  DOM refs
+// ═══════════════════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+const catSel = $('cat-select'), instSel = $('inst-select'), imgSel = $('img-select');
+const btnPrev = $('btn-prev'), btnNext = $('btn-next'), imgCounter = $('img-counter');
+const btnDetect = $('btn-detect'), btnClear = $('btn-clear-roi'), btnSave = $('btn-save-roi');
+const chkAuto = $('chk-auto');
+const slHspan = $('sl-hspan'), slSmin = $('sl-smin'), slVmin = $('sl-vmin');
+const valHspan = $('val-hspan'), valSmin = $('val-smin'), valVmin = $('val-vmin');
+const lblLo = $('lbl-lo'), lblHi = $('lbl-hi');
+const origCanvas = $('orig-canvas'), roiCanvas = $('roi-canvas'), maskCanvas = $('mask-canvas'), morphCanvas = $('morph-canvas');
+const origCtx = origCanvas.getContext('2d'), roiCtx = roiCanvas.getContext('2d'), maskCtx = maskCanvas.getContext('2d'), morphCtx = morphCanvas.getContext('2d');
+const infoOrig = $('info-orig'), infoRoi = $('info-roi'), infoMask = $('info-mask'), infoMorph = $('info-morph');
+const statusBar = $('status');
+
+// ═══════════════════════════════════════════════════════════════════════
+//  RGB → HSV (client-side, for real-time mask)
+// ═══════════════════════════════════════════════════════════════════════
+function rgbToHsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d !== 0) {
+    if (mx === r) h = ((g - b) / d) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+  }
+  h = Math.round(h * 30);           // 0..180  (OpenCV range)
+  if (h < 0) h += 180;
+  const s = mx === 0 ? 0 : Math.round((d / mx) * 255);
+  const v = Math.round(mx * 255);
+  return [h, s, v];
+}
+
+function inRedRange(h, s, v) {
+  return (h <= hsv.h_span || h >= 180 - hsv.h_span) && s >= hsv.s_min && v >= hsv.v_min;
+}
+
+function renderMask() {
+  if (!origImg) { maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height); return; }
+  const w = origImg.naturalWidth, h = origImg.naturalHeight;
+
+  // Draw image onto temp canvas to read pixels
+  const tmp = document.createElement('canvas');
+  tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(origImg, 0, 0);
+  const imgData = tctx.getImageData(0, 0, w, h);
+  const px = imgData.data;
+
+  // Build mask
+  const maskData = new Uint8ClampedArray(w * h * 4);
+  let redCount = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    const [hh, ss, vv] = rgbToHsv(px[i], px[i+1], px[i+2]);
+    const isRed = inRedRange(hh, ss, vv);
+    const val = isRed ? 255 : 0;
+    maskData[i] = val;
+    maskData[i+1] = val;
+    maskData[i+2] = val;
+    maskData[i+3] = 255;
+    if (isRed) redCount++;
+  }
+
+  // Show mask, scaled to fit panel
+  const wrap = maskCanvas.parentElement;
+  const maxW = wrap.clientWidth - 12, maxH = wrap.clientHeight - 12;
+  const scale = Math.min(maxW / w, maxH / h, 4.0);  // allow upscale for small images
+  maskCanvas.width = Math.floor(w * scale);
+  maskCanvas.height = Math.floor(h * scale);
+
+  const tmp2 = document.createElement('canvas');
+  tmp2.width = w; tmp2.height = h;
+  const tctx2 = tmp2.getContext('2d');
+  const id2 = new ImageData(maskData, w, h);
+  tctx2.putImageData(id2, 0, 0);
+
+  maskCtx.imageSmoothingEnabled = false;
+  maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+  maskCtx.drawImage(tmp2, 0, 0, maskCanvas.width, maskCanvas.height);
+
+  const pct = (100 * redCount / (w * h)).toFixed(1);
+  infoMask.textContent = `${w}x${h}  red: ${redCount} px (${pct}%)`;
+
+  // Update slider display labels
+  valHspan.textContent = hsv.h_span;
+  valSmin.textContent = hsv.s_min;
+  valVmin.textContent = hsv.v_min;
+  lblLo.textContent = hsv.h_span;
+  lblHi.textContent = 180 - hsv.h_span;
+}
+
+// ── Morph mask (server-rendered, after morphology) ──
+function renderMorphMask() {
+  if (!origImg) { morphCtx.clearRect(0, 0, morphCanvas.width, morphCanvas.height); return; }
+  const url = '/api/morph-mask';
+  fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      category: curCat, instance: curInst, name: curImg,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min,
+    }),
+  }).then(r => r.blob()).then(blob => {
+    const img = new Image();
+    img.onload = () => {
+      const w = img.naturalWidth, h = img.naturalHeight;
+      const wrap = morphCanvas.parentElement;
+      const maxW = wrap.clientWidth - 12, maxH = wrap.clientHeight - 12;
+      const scale = Math.min(maxW / w, maxH / h, 4.0);
+      morphCanvas.width = Math.floor(w * scale);
+      morphCanvas.height = Math.floor(h * scale);
+      morphCtx.imageSmoothingEnabled = false;
+      morphCtx.clearRect(0, 0, morphCanvas.width, morphCanvas.height);
+      morphCtx.drawImage(img, 0, 0, morphCanvas.width, morphCanvas.height);
+      infoMorph.textContent = w + 'x' + h;
+    };
+    img.src = URL.createObjectURL(blob);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Init
+// ═══════════════════════════════════════════════════════════════════════
+async function init() {
+  status('Loading...');
+  const resp = await fetch('/api/structure');
+  const data = await resp.json();
+  categories = data.categories;
+  instances = data.instances;
+  imageMap = data.image_count;
+
+  catSel.innerHTML = categories.map(c => `<option value="${c}">${c}</option>`).join('');
+  if (categories.length > 0) {
+    curCat = categories[0]; catSel.value = curCat;
+    populateInstances();
+  }
+  status('Ready.');
+}
+
+function populateInstances() {
+  const insts = instances[curCat] || [];
+  instSel.innerHTML = insts.map(i => `<option value="${i}">${i}</option>`).join('');
+  if (insts.length > 0) {
+    curInst = insts[0]; instSel.value = curInst;
+    populateImages();
+  }
+}
+
+function populateImages() {
+  fetch(`/api/images/${encodeURIComponent(curCat)}/${encodeURIComponent(curInst)}`)
+    .then(r => r.json())
+    .then(data => {
+      curImgList = data.images || [];
+      imgSel.innerHTML = curImgList.map((f, i) => `<option value="${i}">${f}</option>`).join('');
+      if (curImgList.length > 0) {
+        curImgIdx = 0; imgSel.value = '0'; curImg = curImgList[0];
+        loadImage();
+      }
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Events
+// ═══════════════════════════════════════════════════════════════════════
+catSel.addEventListener('change', () => { curCat = catSel.value; populateInstances(); });
+instSel.addEventListener('change', () => { curInst = instSel.value; populateImages(); });
+imgSel.addEventListener('change', () => {
+  curImgIdx = parseInt(imgSel.value); curImg = curImgList[curImgIdx];
+  loadImage();
+  if (chkAuto.checked) runDetect();
+});
+btnPrev.addEventListener('click', () => { if (curImgIdx > 0) { curImgIdx--; selectImage(); } });
+btnNext.addEventListener('click', () => { if (curImgIdx < curImgList.length - 1) { curImgIdx++; selectImage(); } });
+btnDetect.addEventListener('click', runDetect);
+btnClear.addEventListener('click', () => { roi = null; renderAll(); });
+btnSave.addEventListener('click', saveRoiCrop);
+$('btn-reset-hsv').addEventListener('click', () => {
+  slHspan.value = 12; slSmin.value = 50; slVmin.value = 50;
+  readSliders();
+});
+
+// HSV sliders → re-render mask + optionally re-detect
+[slHspan, slSmin, slVmin].forEach(sl => {
+  sl.addEventListener('input', () => {
+    readSliders();
+    renderMask();
+  });
+  sl.addEventListener('change', () => {
+    readSliders();
+    renderMask();
+    if (chkAuto.checked && origImg) runDetect();
+  });
+});
+
+function readSliders() {
+  hsv.h_span = parseInt(slHspan.value);
+  hsv.s_min = parseInt(slSmin.value);
+  hsv.v_min = parseInt(slVmin.value);
+}
+
+function selectImage() {
+  imgSel.value = String(curImgIdx); curImg = curImgList[curImgIdx];
+  loadImage();
+  if (chkAuto.checked) runDetect();
+}
+
+// keyboard
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+  if (e.key === 'ArrowLeft' && curImgIdx > 0) { curImgIdx--; selectImage(); }
+  if (e.key === 'ArrowRight' && curImgIdx < curImgList.length - 1) { curImgIdx++; selectImage(); }
+  if (e.key === 'd' || e.key === 'D') runDetect();
+  if (e.key === 'Escape') { roi = null; renderAll(); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Load & render
+// ═══════════════════════════════════════════════════════════════════════
+function loadImage() {
+  roi = null;
+  if (!curImg) { clearAll(); return; }
+  const url = `/api/image-file?category=${encodeURIComponent(curCat)}&instance=${encodeURIComponent(curInst)}&name=${encodeURIComponent(curImg)}`;
+  const img = new Image();
+  img.onload = () => {
+    origImg = img;
+    renderAll();
+    updateCounter();
+  };
+  img.src = url;
+}
+
+function renderAll() {
+  renderOriginal();
+  renderRoiCrop();
+  renderMask();
+  renderMorphMask();
+}
+
+function clearAll() {
+  origCtx.clearRect(0, 0, origCanvas.width, origCanvas.height);
+  roiCtx.clearRect(0, 0, roiCanvas.width, roiCanvas.height);
+  maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+  morphCtx.clearRect(0, 0, morphCanvas.width, morphCanvas.height);
+  origImg = null; roi = null;
+}
+
+function renderOriginal() {
+  if (!origImg) return;
+  const w = origImg.naturalWidth, h = origImg.naturalHeight;
+  const wrap = origCanvas.parentElement;
+  const maxW = wrap.clientWidth - 12, maxH = wrap.clientHeight - 12;
+  const scale = Math.min(maxW / w, maxH / h, 4.0);
+  origCanvas.width = Math.floor(w * scale);
+  origCanvas.height = Math.floor(h * scale);
+
+  origCtx.imageSmoothingEnabled = false;
+  origCtx.clearRect(0, 0, origCanvas.width, origCanvas.height);
+  origCtx.drawImage(origImg, 0, 0, origCanvas.width, origCanvas.height);
+
+  if (roi) {
+    const rx = roi.x * scale, ry = roi.y * scale, rw = roi.w * scale, rh = roi.h * scale;
+    origCtx.strokeStyle = '#00ff00'; origCtx.lineWidth = 2;
+    origCtx.strokeRect(rx, ry, rw, rh);
+    origCtx.fillStyle = 'rgba(0,255,0,0.15)'; origCtx.fillRect(rx, ry, rw, rh);
+  }
+  infoOrig.textContent = `${w}x${h}`;
+}
+
+function renderRoiCrop() {
+  if (!origImg) { roiCtx.clearRect(0, 0, roiCanvas.width, roiCanvas.height); return; }
+  if (roi) {
+    roiCanvas.width = roi.w; roiCanvas.height = roi.h;
+    roiCtx.imageSmoothingEnabled = false;
+    roiCtx.drawImage(origImg, roi.x, roi.y, roi.w, roi.h, 0, 0, roi.w, roi.h);
+  } else {
+    roiCanvas.width = 100; roiCanvas.height = 100;
+    roiCtx.clearRect(0, 0, 100, 100);
+  }
+  infoRoi.textContent = roi ? `${roi.w}x${roi.h} @ (${roi.x},${roi.y})` : 'no ROI';
+}
+
+function updateCounter() {
+  imgCounter.textContent = `${curImgIdx + 1}/${curImgList.length}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Manual ROI drawing
+// ═══════════════════════════════════════════════════════════════════════
+origCanvas.addEventListener('mousedown', e => {
+  if (!origImg) return;
+  const rect = origCanvas.getBoundingClientRect();
+  const sx = origImg.naturalWidth / origCanvas.width;
+  const sy = origImg.naturalHeight / origCanvas.height;
+  drawStart = { x: Math.round((e.clientX - rect.left) * sx), y: Math.round((e.clientY - rect.top) * sy) };
+  drawing = true;
+});
+
+origCanvas.addEventListener('mousemove', e => {
+  if (!drawing || !origImg) return;
+  const rect = origCanvas.getBoundingClientRect();
+  const sx = origImg.naturalWidth / origCanvas.width;
+  const sy = origImg.naturalHeight / origCanvas.height;
+  const cx = Math.round((e.clientX - rect.left) * sx), cy = Math.round((e.clientY - rect.top) * sy);
+  const x = Math.min(drawStart.x, cx), y = Math.min(drawStart.y, cy);
+  const w = Math.abs(cx - drawStart.x), h = Math.abs(cy - drawStart.y);
+  renderOriginal();
+  const scale = origCanvas.width / origImg.naturalWidth;
+  origCtx.strokeStyle = '#ff0'; origCtx.lineWidth = 2;
+  origCtx.setLineDash([4, 4]);
+  origCtx.strokeRect(x * scale, y * scale, w * scale, h * scale);
+  origCtx.setLineDash([]);
+});
+
+origCanvas.addEventListener('mouseup', e => {
+  if (!drawing || !origImg) return;
+  drawing = false;
+  const rect = origCanvas.getBoundingClientRect();
+  const sx = origImg.naturalWidth / origCanvas.width;
+  const sy = origImg.naturalHeight / origCanvas.height;
+  const cx = Math.round((e.clientX - rect.left) * sx), cy = Math.round((e.clientY - rect.top) * sy);
+  const x = Math.min(drawStart.x, cx), y = Math.min(drawStart.y, cy);
+  const w = Math.abs(cx - drawStart.x), h = Math.abs(cy - drawStart.y);
+  if (w > 3 && h > 3) { roi = {x, y, w, h}; }
+  renderAll();
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Detect red (server-side, with current HSV params)
+// ═══════════════════════════════════════════════════════════════════════
+async function runDetect() {
+  if (!curImg) return;
+  status('Detecting...');
+  const resp = await fetch('/api/detect-red', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      category: curCat, instance: curInst, name: curImg,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min,
+    }),
+  });
+  const data = await resp.json();
+  if (data.roi) {
+    roi = data.roi;
+    status(`Detected: (${roi.x},${roi.y}) ${roi.w}x${roi.h}  area=${roi.area.toFixed(0)}`);
+  } else {
+    status('No red region found.');
+  }
+  renderAll();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Save ROI crop
+// ═══════════════════════════════════════════════════════════════════════
+function saveRoiCrop() {
+  if (!origImg || !roi) { status('No ROI to save.'); return; }
+  const c = document.createElement('canvas');
+  c.width = roi.w; c.height = roi.h;
+  c.getContext('2d').drawImage(origImg, roi.x, roi.y, roi.w, roi.h, 0, 0, roi.w, roi.h);
+  c.toBlob(blob => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = curImg.replace(/\.\w+$/, '') + '__fine.png';
+    a.click(); URL.revokeObjectURL(url);
+    status(`Saved: ${a.download}`);
+  }, 'image/png');
+}
+
+function status(msg) { statusBar.textContent = msg; }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Start
+// ═══════════════════════════════════════════════════════════════════════
+init();
+</script>
+</body>
+</html>"""
+
+
+@app.route("/")
+def index():
+    return INDEX_HTML
+
+
+# ---------------------------------------------------------------------------
+#  CLI entry
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Fine crop debugging platform.")
+    parser.add_argument("--work-root", default="work/rough_crop", help="Path to rough_crop directory.")
+    parser.add_argument("--port", type=int, default=5000, help="Server port.")
+    parser.add_argument("--host", default="127.0.0.1", help="Server host.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    global WORK_ROOT, CATEGORIES, INSTANCES, IMAGES
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    project_root = Path(__file__).resolve().parent.parent
+    WORK_ROOT = (project_root / args.work_root).resolve()
+    if not WORK_ROOT.exists():
+        print(f"ERROR: work root not found: {WORK_ROOT}", file=sys.stderr)
+        return 1
+
+    CATEGORIES, INSTANCES, IMAGES = discover_structure(WORK_ROOT)
+    total_instances = sum(len(v) for v in INSTANCES.values())
+    total_images = sum(len(files) for inst_map in IMAGES.values() for files in inst_map.values())
+    print(f"Data root : {WORK_ROOT}")
+    print(f"Categories: {len(CATEGORIES)}")
+    print(f"Instances : {total_instances}")
+    print(f"Images    : {total_images}")
+    print(f"Server    : http://{args.host}:{args.port}")
+    print("Press Ctrl+C to stop.")
+
+    app.run(host=args.host, port=args.port, debug=False)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
