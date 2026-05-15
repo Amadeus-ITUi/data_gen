@@ -60,6 +60,86 @@ def detect_red_roi(
     return {"x": int(x), "y": int(y), "w": int(w), "h": int(h), "area": float(area)}
 
 
+def detect_red_roi_v2(
+    image: np.ndarray,
+    h_span: int = 12,
+    s_min: int = 50,
+    v_min: int = 50,
+    close_iter: int = 1,
+    open_iter: int = 1,
+    ratio_w: float = 1.0,
+    ratio_h: float = 0.42,
+    offset_ratio: float = 0.417,
+) -> dict | None:
+    """Bottom-anchored ROI with lift offset.
+
+    Physical model: red rectangle (120x50mm) sits below a 120x120mm square.
+    The contour bounding rect is found within the square; its bottom edge
+    is lifted by N = bw * offset_ratio pixels, then the ROI is drawn
+    upward from that anchor point.
+
+      anchor_y = (by + bh) - bw * offset_ratio    (lift from contour bottom)
+      new_w = bbox.w * ratio_w
+      new_h = bbox.w * ratio_h
+      new_x = bbox.x + (bbox.w - new_w) / 2       (centred horizontally)
+      new_y = anchor_y - new_h                     (ROI extends upward from anchor)
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    lower_red1 = np.array([0, s_min, v_min], dtype=np.uint8)
+    upper_red1 = np.array([h_span, 255, 255], dtype=np.uint8)
+    lower_red2 = np.array([180 - h_span, s_min, v_min], dtype=np.uint8)
+    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
+
+    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    kernel = np.ones((3, 3), np.uint8)
+    if close_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_iter)
+    if open_iter > 0:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_iter)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    if area <= 50:
+        return None
+
+    bx, by, bw, bh = cv2.boundingRect(largest)
+    img_h, img_w = image.shape[:2]
+
+    # Derive ROI: lift anchor from contour bottom, then draw upward
+    lift = int(round(bw * offset_ratio))
+    anchor_y = (by + bh) - lift
+    new_w = max(3, int(round(bw * ratio_w)))
+    new_h = max(3, int(round(bw * ratio_h)))
+    new_x = int(round(bx + (bw - new_w) / 2.0))
+    new_y = anchor_y - new_h
+
+    # Clamp to image bounds
+    if new_x < 0:
+        new_x = 0
+    if new_y < 0:
+        new_y = 0
+    if new_x + new_w > img_w:
+        new_x = img_w - new_w
+    if new_y + new_h > img_h:
+        new_y = img_h - new_h
+
+    return {
+        "x": new_x, "y": new_y, "w": new_w, "h": new_h,
+        "area": float(area),
+        "bbox": {"x": int(bx), "y": int(by), "w": int(bw), "h": int(bh)},
+        "lift": lift,
+        "anchor_y": anchor_y,
+    }
+
+
 def make_morph_mask(
     image: np.ndarray,
     h_span: int = 12,
@@ -161,6 +241,10 @@ def api_detect_red():
     v_min = int(data.get("v_min", 50))
     close_iter = int(data.get("close_iter", 1))
     open_iter = int(data.get("open_iter", 1))
+    mode = data.get("mode", "contour")
+    ratio_w = float(data.get("ratio_w", 1.0))
+    ratio_h = float(data.get("ratio_h", 0.42))
+    offset_ratio = float(data.get("offset_ratio", 0.417))
 
     path = WORK_ROOT / cat / inst / name
     if not path.exists():
@@ -170,7 +254,17 @@ def api_detect_red():
     if image is None:
         return jsonify({"error": "failed to read image"}), 500
 
-    result = detect_red_roi(image, h_span=h_span, s_min=s_min, v_min=v_min, close_iter=close_iter, open_iter=open_iter)
+    if mode == "bottom":
+        result = detect_red_roi_v2(
+            image, h_span=h_span, s_min=s_min, v_min=v_min,
+            close_iter=close_iter, open_iter=open_iter,
+            ratio_w=ratio_w, ratio_h=ratio_h, offset_ratio=offset_ratio,
+        )
+    else:
+        result = detect_red_roi(
+            image, h_span=h_span, s_min=s_min, v_min=v_min,
+            close_iter=close_iter, open_iter=open_iter,
+        )
     h, w = image.shape[:2]
     return jsonify({"roi": result, "image_width": w, "image_height": h})
 
@@ -272,6 +366,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <label>Open <input type="range" id="sl-open" min="0" max="4" value="1" step="1"><span class="val" id="val-open">1</span></label>
   <button id="btn-reset-hsv">Reset HSV</button>
   <span style="font-size:10px;color:#666;">| red ranges: [0,&thinsp;<span id="lbl-lo">12</span>] &amp; [<span id="lbl-hi">168</span>,&thinsp;180]</span>
+  <label style="margin-left:8px;">Mode <select id="sel-mode"><option value="contour">Contour</option><option value="bottom">Bottom-Anchor</option></select></label>
+  <label>R_W <input type="range" id="sl-rw" min="0.3" max="2.0" value="1.0" step="0.05"><span class="val" id="val-rw">1.0</span></label>
+  <label>R_H <input type="range" id="sl-rh" min="0.1" max="1.5" value="0.42" step="0.01"><span class="val" id="val-rh">0.42</span></label>
+  <label>Lift <input type="range" id="sl-lift" min="0.0" max="1.0" value="0.417" step="0.005"><span class="val" id="val-lift">0.417</span></label>
 </div>
 
 <!-- ── 2x2 panels ── -->
@@ -308,7 +406,7 @@ let roi = null;
 let drawing = false, drawStart = {x:0, y:0};
 
 // HSV params (synced to sliders)
-let hsv = { h_span: 12, s_min: 50, v_min: 50, close_iter: 1, open_iter: 1 };
+let hsv = { h_span: 12, s_min: 50, v_min: 50, close_iter: 1, open_iter: 1, mode: "contour", ratio_w: 1.0, ratio_h: 0.42, offset_ratio: 0.417 };
 
 // ═══════════════════════════════════════════════════════════════════════
 //  DOM refs
@@ -318,8 +416,9 @@ const catSel = $('cat-select'), instSel = $('inst-select'), imgSel = $('img-sele
 const btnPrev = $('btn-prev'), btnNext = $('btn-next'), imgCounter = $('img-counter');
 const btnDetect = $('btn-detect'), btnClear = $('btn-clear-roi'), btnSave = $('btn-save-roi');
 const chkAuto = $('chk-auto');
-const slHspan = $('sl-hspan'), slSmin = $('sl-smin'), slVmin = $('sl-vmin'), slClose = $('sl-close'), slOpen = $('sl-open');
-const valHspan = $('val-hspan'), valSmin = $('val-smin'), valVmin = $('val-vmin'), valClose = $('val-close'), valOpen = $('val-open');
+const slHspan = $('sl-hspan'), slSmin = $('sl-smin'), slVmin = $('sl-vmin'), slClose = $('sl-close'), slOpen = $('sl-open'), slRw = $('sl-rw'), slRh = $('sl-rh'), slLift = $('sl-lift');
+const selMode = $('sel-mode');
+const valHspan = $('val-hspan'), valSmin = $('val-smin'), valVmin = $('val-vmin'), valClose = $('val-close'), valOpen = $('val-open'), valRw = $('val-rw'), valRh = $('val-rh'), valLift = $('val-lift');
 const lblLo = $('lbl-lo'), lblHi = $('lbl-hi');
 const origCanvas = $('orig-canvas'), roiCanvas = $('roi-canvas'), maskCanvas = $('mask-canvas'), morphCanvas = $('morph-canvas');
 const origCtx = origCanvas.getContext('2d'), roiCtx = roiCanvas.getContext('2d'), maskCtx = maskCanvas.getContext('2d'), morphCtx = morphCanvas.getContext('2d');
@@ -401,6 +500,9 @@ function renderMask() {
   valVmin.textContent = hsv.v_min;
   valClose.textContent = hsv.close_iter;
   valOpen.textContent = hsv.open_iter;
+  valRw.textContent = hsv.ratio_w.toFixed(2);
+  valRh.textContent = hsv.ratio_h.toFixed(2);
+  valLift.textContent = hsv.offset_ratio.toFixed(3);
   lblLo.textContent = hsv.h_span;
   lblHi.textContent = 180 - hsv.h_span;
 }
@@ -414,7 +516,7 @@ function renderMorphMask() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       category: curCat, instance: curInst, name: curImg,
-      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter, mode: hsv.mode, ratio_w: hsv.ratio_w, ratio_h: hsv.ratio_h, offset_ratio: hsv.offset_ratio,
     }),
   }).then(r => r.blob()).then(blob => {
     const img = new Image();
@@ -491,12 +593,12 @@ btnDetect.addEventListener('click', runDetect);
 btnClear.addEventListener('click', () => { roi = null; renderAll(); });
 btnSave.addEventListener('click', saveRoiCrop);
 $('btn-reset-hsv').addEventListener('click', () => {
-  slHspan.value = 12; slSmin.value = 50; slVmin.value = 50; slClose.value = 1; slOpen.value = 1;
+  slHspan.value = 12; slSmin.value = 50; slVmin.value = 50; slClose.value = 1; slOpen.value = 1; slRw.value = 1.0; slRh.value = 0.42; slLift.value = 0.417; selMode.value = 'contour';
   readSliders();
 });
 
 // HSV sliders → re-render mask + optionally re-detect
-[slHspan, slSmin, slVmin, slClose, slOpen].forEach(sl => {
+[slHspan, slSmin, slVmin, slClose, slOpen, slRw, slRh, slLift].forEach(sl => {
   sl.addEventListener('input', () => {
     readSliders();
     renderMask();
@@ -508,6 +610,10 @@ $('btn-reset-hsv').addEventListener('click', () => {
     if (chkAuto.checked && origImg) runDetect();
   });
 });
+selMode.addEventListener('change', () => {
+  readSliders();
+  if (chkAuto.checked && origImg) runDetect();
+});
 
 function readSliders() {
   hsv.h_span = parseInt(slHspan.value);
@@ -515,6 +621,10 @@ function readSliders() {
   hsv.v_min = parseInt(slVmin.value);
   hsv.close_iter = parseInt(slClose.value);
   hsv.open_iter = parseInt(slOpen.value);
+  hsv.mode = selMode.value;
+  hsv.ratio_w = parseFloat(slRw.value);
+  hsv.ratio_h = parseFloat(slRh.value);
+  hsv.offset_ratio = parseFloat(slLift.value);
 }
 
 function selectImage() {
@@ -577,6 +687,25 @@ function renderOriginal() {
   origCtx.drawImage(origImg, 0, 0, origCanvas.width, origCanvas.height);
 
   if (roi) {
+    // Show contour bbox (red dashed) + anchor line in bottom-anchor mode
+    if (roi.bbox) {
+      const bx = roi.bbox.x * scale, by = roi.bbox.y * scale, bw = roi.bbox.w * scale, bh = roi.bbox.h * scale;
+      origCtx.strokeStyle = '#ff4444'; origCtx.lineWidth = 1;
+      origCtx.setLineDash([3, 3]);
+      origCtx.strokeRect(bx, by, bw, bh);
+      origCtx.setLineDash([]);
+      // Anchor line (cyan) at the lifted bottom
+      if (roi.anchor_y !== undefined) {
+        const ay = roi.anchor_y * scale;
+        origCtx.strokeStyle = '#00ffff'; origCtx.lineWidth = 1;
+        origCtx.setLineDash([2, 4]);
+        origCtx.beginPath();
+        origCtx.moveTo(0, ay);
+        origCtx.lineTo(origCanvas.width, ay);
+        origCtx.stroke();
+        origCtx.setLineDash([]);
+      }
+    }
     const rx = roi.x * scale, ry = roi.y * scale, rw = roi.w * scale, rh = roi.h * scale;
     origCtx.strokeStyle = '#00ff00'; origCtx.lineWidth = 2;
     origCtx.strokeRect(rx, ry, rw, rh);
@@ -595,7 +724,7 @@ function renderRoiCrop() {
     roiCanvas.width = 100; roiCanvas.height = 100;
     roiCtx.clearRect(0, 0, 100, 100);
   }
-  infoRoi.textContent = roi ? `${roi.w}x${roi.h} @ (${roi.x},${roi.y})` : 'no ROI';
+  infoRoi.textContent = roi ? `${roi.w}x${roi.h} @ (${roi.x},${roi.y})` + (roi.bbox ? ' [bottom]' : ' [contour]') : 'no ROI';
 }
 
 function updateCounter() {
@@ -654,7 +783,7 @@ async function runDetect() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({
       category: curCat, instance: curInst, name: curImg,
-      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter,
+      h_span: hsv.h_span, s_min: hsv.s_min, v_min: hsv.v_min, close_iter: hsv.close_iter, open_iter: hsv.open_iter, mode: hsv.mode, ratio_w: hsv.ratio_w, ratio_h: hsv.ratio_h, offset_ratio: hsv.offset_ratio,
     }),
   });
   const data = await resp.json();
