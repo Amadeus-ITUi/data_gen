@@ -1,0 +1,32 @@
+model:
+  weights_path: model/weights/best.pt
+  class_names:
+    - ambulance
+    - armored_car
+    - bomb
+    - gun
+    - medicine
+    - telescope
+  imgsz: 640
+  conf_threshold: 0.35
+  iou_threshold: 0.45
+  device: null
+  max_det: 20
+  show_labels: true
+  show_conf: true
+
+camera:
+  default_index: 1
+  scan_max_index: 5
+  backend: DSHOW
+  fourcc: MJPG
+  width: 320
+  height: 240
+  fps: 120
+
+review:
+  video_root: video
+  playback_fps: null
+  window_name: YOLO Video Review
+  start_class: null
+  start_video: null

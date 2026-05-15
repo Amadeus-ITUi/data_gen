@@ -1,0 +1,35 @@
+paths:
+  video_root: video
+  work_root: work
+  dataset_root: dataset
+
+detection:
+  yolo_weights: model/weights/best.pt
+  conf_threshold: 0.25
+  device: null
+  classes: null
+  frame_sample_stride: 3
+
+crop:
+  roi_size: 64
+  margin_ratio: 0.15
+  min_bbox_size: 12
+  scale_factor: 2.0
+
+selection:
+  candidate_per_instance: 20
+  roi_pool_limit_per_instance: 120
+  pixel_diff_metric: mae_gray
+  pixel_diff_threshold: 0.08
+
+output:
+  review_enabled: true
+  target_per_class: 500
+  image_extension: png
+
+rough_crop:
+  output_root: work/rough_crop
+  frame_stride: 1
+  scale_factor: 2.0
+  image_extension: png
+  png_compression: 0
